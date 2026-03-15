@@ -82,6 +82,38 @@ if "messages" not in st.session_state: st.session_state.messages = []
 for msg in st.session_state.messages:
     with st.chat_message(msg["role"]): st.markdown(msg["content"], unsafe_allow_html=True)
 
+# Fix: prevent Enter key from submitting during IME composition (e.g. Chinese/Japanese input)
+import streamlit.components.v1 as components
+components.html("""
+<script>
+(function() {
+    if (window.parent.__imeFixInstalled) return;
+    window.parent.__imeFixInstalled = true;
+    const doc = window.parent.document;
+    let composing = false;
+    doc.addEventListener('compositionstart', () => { composing = true; }, true);
+    doc.addEventListener('compositionend', () => { composing = false; }, true);
+    function installFix() {
+        const textareas = doc.querySelectorAll('textarea[data-testid="stChatInputTextArea"]');
+        textareas.forEach(ta => {
+            if (ta.__imeFix) return;
+            ta.__imeFix = true;
+            ta.addEventListener('keydown', function(e) {
+                if (e.key === 'Enter' && !e.shiftKey &&
+                    (e.isComposing || composing || e.keyCode === 229)) {
+                    e.stopImmediatePropagation();
+                    e.preventDefault();
+                }
+            }, true);
+        });
+    }
+    installFix();
+    const observer = new MutationObserver(() => installFix());
+    observer.observe(doc.body, { childList: true, subtree: true });
+})();
+</script>
+""", height=0)
+
 if prompt := st.chat_input("请输入指令"):
     st.session_state.messages.append({"role": "user", "content": prompt})
     with st.chat_message("user"): st.markdown(prompt, unsafe_allow_html=False)  # 小心 XSS
