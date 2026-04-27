@@ -1,6 +1,19 @@
 import asyncio, os, select, sys, threading, time, traceback
 from collections import deque
 from datetime import datetime
+from typing import Any, Callable, Dict, Optional, TypedDict
+
+
+class TurnContext(TypedDict, total=False):
+    """Hook callback receives agent locals() — these are the keys we rely on."""
+    exit_reason: Optional[str]
+    response: Any
+    summary: Optional[str]
+    tool_calls: Optional[list]
+    turn: int
+
+
+TurnHookFn = Callable[[TurnContext], None]
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from agentmain import GeneraticAgent
@@ -16,10 +29,6 @@ except Exception:
     sys.exit(1)
 
 # ── Config ──────────────────────────────────────────────────────────
-agent = GeneraticAgent(); agent.verbose = False
-if not hasattr(agent, '_turn_end_hooks'):
-    agent._turn_end_hooks = {}
-
 BOT_ID    = str(mykeys.get("wecom_bot_id", "") or "").strip()
 SECRET    = str(mykeys.get("wecom_secret", "") or "").strip()
 WELCOME   = str(mykeys.get("wecom_welcome_message", "") or "").strip()
@@ -45,64 +54,29 @@ def _fmt_tool(tc):
     args = {k: v for k, v in (tc.get("args") or {}).items() if not k.startswith("_")}
     return f"{name}({str(args)[:120]})"
 
-
-# ── Terminal CLI ────────────────────────────────────────────────────
-def _terminal_thread(app):
-    while True:
-        try:
-            if not select.select([sys.stdin], [], [], 1.0)[0]:
-                continue
-            cmd = sys.stdin.readline().strip().lower()
-        except Exception:
-            break
-        if not cmd:
-            continue
-        if cmd == "help":
-            _tprint("  status        — 查看状态")
-            _tprint("  stop [user]   — 停止任务（多任务时需指定 user）")
-            _tprint("  exit          — 退出进程")
-        elif cmd == "status":
-            _tprint(f"[{_ts()}] 📊 收到 {app._stats['received']} 条 | 完成 {app._stats['completed']} 条 | 活跃 {len(app.user_tasks)}")
-            for uid, st in app.user_tasks.items():
-                _tprint(f"  ├ {uid}: running={st.get('running')}")
-            _tprint(f"  Agent running: {agent.is_running} | 允许: {ALLOWED or '全部'}")
-        elif cmd.startswith("stop"):
-            parts = cmd.split(None, 1)
-            tasks = app.user_tasks
-            if not tasks:
-                _tprint("  没有活跃任务")
-            elif len(parts) > 1:
-                uid = parts[1]
-                if uid in tasks:
-                    tasks[uid]["running"] = False
-                    _tprint(f"  ⏹️ 已停止 {uid}")
-                else:
-                    _tprint(f"  未找到: {uid}")
-            elif len(tasks) == 1:
-                uid = next(iter(tasks))
-                tasks[uid]["running"] = False
-                _tprint(f"  ⏹️ 已停止 {uid}")
-            else:
-                _tprint("  多个任务，请指定: stop <user_id>")
-                for uid in tasks:
-                    _tprint(f"  ├ {uid}")
-        elif cmd == "exit":
-            _tprint(f"[{_ts()}] 👋 退出...")
-            os._exit(0)
-        else:
-            _tprint("  可用命令: help | status | stop | exit")
-
-
 # ── WeComApp ────────────────────────────────────────────────────────
 class WeComApp(AgentChatMixin):
     label, source, split_limit = "WeCom", "wecom", 1200  # split_limit: wecom single-msg char cap
 
-    def __init__(self):
+    def __init__(self, agent):
+        self.agent = agent
+        if not hasattr(agent, '_turn_end_hooks'):
+            agent._turn_end_hooks = {}
         super().__init__(agent, {})
+        self._allowed = ALLOWED
         self.client = None
         self.chat_frames = {}       # chat_id → latest frame (for reply)
         self._seen = deque(maxlen=1000)
         self._stats = {"received": 0, "completed": 0}
+
+    # ── hook management ──────────────────────────────────────────────
+    def _register_hook(self, key: str, fn: TurnHookFn) -> None:
+        """Register a turn-end callback on the agent."""
+        self.agent._turn_end_hooks[key] = fn
+
+    def _unregister_hook(self, key: str) -> None:
+        """Remove a turn-end callback."""
+        self.agent._turn_end_hooks.pop(key, None)
 
     # ── frame accept: dedup → auth → register ───────────────────────
     def _accept(self, frame):
@@ -209,15 +183,15 @@ class WeComApp(AgentChatMixin):
 
         try:
             await self.send_text(chat_id, "🤔 思考中...")
-            agent._turn_end_hooks[hook_key] = _on_turn
-            agent.put_task(f"{FILE_HINT}\n\n{text}", source=self.source)
+            self._register_hook(hook_key, _on_turn)
+            self.agent.put_task(f"{FILE_HINT}\n\n{text}", source=self.source)
 
             # Wait for: hook signals done / user stops / agent crashes
             t0 = time.time()
             while state["running"] and not done_event.is_set():
                 await asyncio.sleep(1)
                 elapsed = time.time() - t0
-                if elapsed > 10 and not agent.is_running:
+                if elapsed > 10 and not self.agent.is_running:
                     await asyncio.sleep(3)  # grace period for hook delivery
                     if not done_event.is_set():
                         break
@@ -237,7 +211,7 @@ class WeComApp(AgentChatMixin):
             traceback.print_exc()
             await self.send_text(chat_id, f"❌ 错误: {e}")
         finally:
-            agent._turn_end_hooks.pop(hook_key, None)
+            self._unregister_hook(hook_key)
             self.user_tasks.pop(chat_id, None)
 
     # ── message handlers ────────────────────────────────────────────
@@ -296,9 +270,56 @@ class WeComApp(AgentChatMixin):
     async def on_disconnected(self, *_):  _tprint("[WeCom] disconnected")
     async def on_error(self, frame):     _tprint(f"[WeCom] error: {frame}")
 
-    async def start(self):
-        self.client = WSClient(BOT_ID, SECRET, reconnect_interval=1000,
-                               max_reconnect_attempts=-1, heartbeat_interval=30000)
+    # ── Terminal CLI (runs in background thread) ─────────────────────
+    def _terminal_loop(self):
+        """Blocking CLI loop — run in a daemon thread."""
+        while True:
+            try:
+                if not select.select([sys.stdin], [], [], 1.0)[0]:
+                    continue
+                cmd = sys.stdin.readline().strip().lower()
+            except Exception:
+                break
+            if not cmd:
+                continue
+            if cmd == "help":
+                _tprint("  status        — 查看状态")
+                _tprint("  stop [user]   — 停止任务（多任务时需指定 user）")
+                _tprint("  exit          — 退出进程")
+            elif cmd == "status":
+                _tprint(f"[{_ts()}] 📊 收到 {self._stats['received']} 条 | 完成 {self._stats['completed']} 条 | 活跃 {len(self.user_tasks)}")
+                for uid, st in self.user_tasks.items():
+                    _tprint(f"  ├ {uid}: running={st.get('running')}")
+                _tprint(f"  Agent running: {self.agent.is_running} | 允许: {self._allowed or '全部'}")
+            elif cmd.startswith("stop"):
+                parts = cmd.split(None, 1)
+                tasks = self.user_tasks
+                if not tasks:
+                    _tprint("  没有活跃任务")
+                elif len(parts) > 1:
+                    uid = parts[1]
+                    if uid in tasks:
+                        tasks[uid]["running"] = False
+                        _tprint(f"  ⏹️ 已停止 {uid}")
+                    else:
+                        _tprint(f"  未找到: {uid}")
+                elif len(tasks) == 1:
+                    uid = next(iter(tasks))
+                    tasks[uid]["running"] = False
+                    _tprint(f"  ⏹️ 已停止 {uid}")
+                else:
+                    _tprint("  多个任务，请指定: stop <user_id>")
+                    for uid in tasks:
+                        _tprint(f"  ├ {uid}")
+            elif cmd == "exit":
+                _tprint(f"[{_ts()}] 👋 退出...")
+                os._exit(0)
+            else:
+                _tprint("  可用命令: help | status | stop | exit")
+
+    async def start(self, client=None):
+        self.client = client or WSClient(BOT_ID, SECRET, reconnect_interval=1000,
+                                         max_reconnect_attempts=-1, heartbeat_interval=30000)
         for ev, fn in {
             "connected": self.on_connected, "authenticated": self.on_authenticated,
             "disconnected": self.on_disconnected, "error": self.on_error,
@@ -306,7 +327,7 @@ class WeComApp(AgentChatMixin):
             "message.file": self.on_file, "event.enter_chat": self.on_enter_chat,
         }.items():
             self.client.on(ev, fn)
-        _tprint("[WeCom] starting (v4)...")
+        _tprint("[WeCom] starting ...")
         await self.client.connect()
         while True:
             await asyncio.sleep(1)
@@ -314,16 +335,17 @@ class WeComApp(AgentChatMixin):
 
 # ── Main ────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    _LOCK = ensure_single_instance(PORT, "WeCom_v4")
+    agent = GeneraticAgent(); agent.verbose = False
+    _LOCK = ensure_single_instance(PORT, "WeCom")
     require_runtime(agent, "WeCom", wecom_bot_id=BOT_ID, wecom_secret=SECRET)
-    redirect_log(__file__, "wecomapp_v4.log", "WeCom", ALLOWED)
+    redirect_log(__file__, "wecomapp.log", "WeCom", ALLOWED)
     _tprint("\n═══════════════════════════════════════════")
-    _tprint("  企业微信 Agent v4  (长连接模式)")
+    _tprint("  企业微信 Agent  (长连接模式)")
     _tprint(f"  端口锁: {PORT} | 允许用户: {ALLOWED or '全部'}")
     _tprint("═══════════════════════════════════════════")
     _tprint("  终端命令:  help | status | stop | exit")
 
-    app = WeComApp()
+    app = WeComApp(agent)
     threading.Thread(target=agent.run, daemon=True).start()
-    threading.Thread(target=_terminal_thread, args=(app,), daemon=True).start()
+    threading.Thread(target=app._terminal_loop, daemon=True).start()
     asyncio.run(app.start())
